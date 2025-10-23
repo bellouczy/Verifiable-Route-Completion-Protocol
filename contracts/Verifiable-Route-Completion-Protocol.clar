@@ -1,0 +1,271 @@
+;; title: Verifiable-Route-Completion-Protocol
+
+(define-constant contract-owner tx-sender)
+(define-constant err-owner-only (err u100))
+(define-constant err-not-found (err u101))
+(define-constant err-unauthorized (err u102))
+(define-constant err-already-exists (err u103))
+(define-constant err-invalid-checkpoint (err u104))
+(define-constant err-route-not-active (err u105))
+(define-constant err-insufficient-payment (err u106))
+(define-constant err-already-verified (err u107))
+(define-constant err-route-completed (err u108))
+(define-constant err-invalid-coordinates (err u109))
+(define-constant err-checkpoint-expired (err u110))
+
+(define-data-var route-nonce uint u0)
+(define-data-var checkpoint-nonce uint u0)
+
+(define-map routes
+    uint
+    {
+        shipper: principal,
+        transporter: principal,
+        payment-amount: uint,
+        created-at: uint,
+        completed-at: (optional uint),
+        status: (string-ascii 20),
+        total-checkpoints: uint,
+        verified-checkpoints: uint
+    }
+)
+
+(define-map checkpoints
+    {route-id: uint, checkpoint-id: uint}
+    {
+        latitude: int,
+        longitude: int,
+        tolerance: uint,
+        verified: bool,
+        verified-at: (optional uint),
+        verified-by: (optional principal),
+        deadline: uint
+    }
+)
+
+(define-map route-payments
+    uint
+    {
+        amount: uint,
+        released: bool,
+        released-at: (optional uint)
+    }
+)
+
+(define-map transporter-stats
+    principal
+    {
+        routes-completed: uint,
+        total-earned: uint,
+        success-rate: uint
+    }
+)
+
+(define-public (create-route (transporter principal) (payment-amount uint) (total-checkpoints uint))
+    (let
+        (
+            (route-id (var-get route-nonce))
+            (current-height stacks-block-height)
+        )
+        (asserts! (> payment-amount u0) err-insufficient-payment)
+        (asserts! (> total-checkpoints u0) err-invalid-checkpoint)
+        (try! (stx-transfer? payment-amount tx-sender (as-contract tx-sender)))
+        (map-set routes route-id {
+            shipper: tx-sender,
+            transporter: transporter,
+            payment-amount: payment-amount,
+            created-at: current-height,
+            completed-at: none,
+            status: "active",
+            total-checkpoints: total-checkpoints,
+            verified-checkpoints: u0
+        })
+        (map-set route-payments route-id {
+            amount: payment-amount,
+            released: false,
+            released-at: none
+        })
+        (var-set route-nonce (+ route-id u1))
+        (ok route-id)
+    )
+)
+
+(define-public (add-checkpoint (route-id uint) (latitude int) (longitude int) (tolerance uint) (deadline-blocks uint))
+    (let
+        (
+            (route (unwrap! (map-get? routes route-id) err-not-found))
+            (checkpoint-id (var-get checkpoint-nonce))
+            (current-height stacks-block-height)
+        )
+        (asserts! (is-eq tx-sender (get shipper route)) err-unauthorized)
+        (asserts! (is-eq (get status route) "active") err-route-not-active)
+        (asserts! (and (>= latitude -90000000) (<= latitude 90000000)) err-invalid-coordinates)
+        (asserts! (and (>= longitude -180000000) (<= longitude 180000000)) err-invalid-coordinates)
+        (map-set checkpoints {route-id: route-id, checkpoint-id: checkpoint-id} {
+            latitude: latitude,
+            longitude: longitude,
+            tolerance: tolerance,
+            verified: false,
+            verified-at: none,
+            verified-by: none,
+            deadline: (+ current-height deadline-blocks)
+        })
+        (var-set checkpoint-nonce (+ checkpoint-id u1))
+        (ok checkpoint-id)
+    )
+)
+
+(define-public (verify-checkpoint (route-id uint) (checkpoint-id uint) (actual-lat int) (actual-lon int))
+    (let
+        (
+            (route (unwrap! (map-get? routes route-id) err-not-found))
+            (checkpoint (unwrap! (map-get? checkpoints {route-id: route-id, checkpoint-id: checkpoint-id}) err-not-found))
+            (current-height stacks-block-height)
+            (lat-diff (if (>= actual-lat (get latitude checkpoint))
+                         (- actual-lat (get latitude checkpoint))
+                         (- (get latitude checkpoint) actual-lat)))
+            (lon-diff (if (>= actual-lon (get longitude checkpoint))
+                         (- actual-lon (get longitude checkpoint))
+                         (- (get longitude checkpoint) actual-lon)))
+        )
+        (asserts! (is-eq tx-sender (get transporter route)) err-unauthorized)
+        (asserts! (is-eq (get status route) "active") err-route-not-active)
+        (asserts! (not (get verified checkpoint)) err-already-verified)
+        (asserts! (<= current-height (get deadline checkpoint)) err-checkpoint-expired)
+        (asserts! (<= (to-uint lat-diff) (get tolerance checkpoint)) err-invalid-coordinates)
+        (asserts! (<= (to-uint lon-diff) (get tolerance checkpoint)) err-invalid-coordinates)
+        (map-set checkpoints {route-id: route-id, checkpoint-id: checkpoint-id}
+            (merge checkpoint {
+                verified: true,
+                verified-at: (some current-height),
+                verified-by: (some tx-sender)
+            })
+        )
+        (let
+            (
+                (updated-verified (+ (get verified-checkpoints route) u1))
+            )
+            (map-set routes route-id
+                (merge route {verified-checkpoints: updated-verified})
+            )
+            (if (is-eq updated-verified (get total-checkpoints route))
+                (complete-route route-id)
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-private (complete-route (route-id uint))
+    (let
+        (
+            (route (unwrap! (map-get? routes route-id) err-not-found))
+            (payment (unwrap! (map-get? route-payments route-id) err-not-found))
+            (current-height stacks-block-height)
+            (transporter (get transporter route))
+        )
+        (asserts! (not (get released payment)) err-route-completed)
+        (try! (as-contract (stx-transfer? (get amount payment) tx-sender transporter)))
+        (map-set routes route-id
+            (merge route {
+                status: "completed",
+                completed-at: (some current-height)
+            })
+        )
+        (map-set route-payments route-id
+            (merge payment {
+                released: true,
+                released-at: (some current-height)
+            })
+        )
+        (unwrap-panic (update-transporter-stats transporter (get payment-amount route)))
+        (ok true)
+    )
+)
+
+(define-private (update-transporter-stats (transporter principal) (payment uint))
+    (begin
+        (map-set transporter-stats transporter 
+            (let
+                (
+                    (stats (default-to 
+                        {routes-completed: u0, total-earned: u0, success-rate: u100}
+                        (map-get? transporter-stats transporter)
+                    ))
+                )
+                {
+                    routes-completed: (+ (get routes-completed stats) u1),
+                    total-earned: (+ (get total-earned stats) payment),
+                    success-rate: u100
+                }
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (cancel-route (route-id uint))
+    (let
+        (
+            (route (unwrap! (map-get? routes route-id) err-not-found))
+            (payment (unwrap! (map-get? route-payments route-id) err-not-found))
+            (current-height stacks-block-height)
+        )
+        (asserts! (is-eq tx-sender (get shipper route)) err-unauthorized)
+        (asserts! (is-eq (get status route) "active") err-route-not-active)
+        (asserts! (is-eq (get verified-checkpoints route) u0) err-route-completed)
+        (asserts! (not (get released payment)) err-route-completed)
+        (try! (as-contract (stx-transfer? (get amount payment) tx-sender (get shipper route))))
+        (map-set routes route-id
+            (merge route {status: "cancelled"})
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-route (route-id uint))
+    (ok (map-get? routes route-id))
+)
+
+(define-read-only (get-checkpoint (route-id uint) (checkpoint-id uint))
+    (ok (map-get? checkpoints {route-id: route-id, checkpoint-id: checkpoint-id}))
+)
+
+(define-read-only (get-payment-info (route-id uint))
+    (ok (map-get? route-payments route-id))
+)
+
+(define-read-only (get-transporter-stats (transporter principal))
+    (ok (map-get? transporter-stats transporter))
+)
+
+(define-read-only (get-route-progress (route-id uint))
+    (let
+        (
+            (route (unwrap! (map-get? routes route-id) err-not-found))
+        )
+        (ok {
+            verified: (get verified-checkpoints route),
+            total: (get total-checkpoints route),
+            percentage: (/ (* (get verified-checkpoints route) u100) (get total-checkpoints route))
+        })
+    )
+)
+
+(define-read-only (is-checkpoint-valid (route-id uint) (checkpoint-id uint) (actual-lat int) (actual-lon int))
+    (let
+        (
+            (checkpoint (unwrap! (map-get? checkpoints {route-id: route-id, checkpoint-id: checkpoint-id}) err-not-found))
+            (lat-diff (if (>= actual-lat (get latitude checkpoint))
+                         (- actual-lat (get latitude checkpoint))
+                         (- (get latitude checkpoint) actual-lat)))
+            (lon-diff (if (>= actual-lon (get longitude checkpoint))
+                         (- actual-lon (get longitude checkpoint))
+                         (- (get longitude checkpoint) actual-lon)))
+        )
+        (ok (and 
+            (<= (to-uint lat-diff) (get tolerance checkpoint))
+            (<= (to-uint lon-diff) (get tolerance checkpoint))
+        ))
+    )
+)
