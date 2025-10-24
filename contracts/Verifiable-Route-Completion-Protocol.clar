@@ -47,7 +47,8 @@
     uint
     {
         amount: uint,
-        released: bool,
+        amount-released: uint,
+        fully-released: bool,
         released-at: (optional uint)
     }
 )
@@ -82,7 +83,8 @@
         })
         (map-set route-payments route-id {
             amount: payment-amount,
-            released: false,
+            amount-released: u0,
+            fully-released: false,
             released-at: none
         })
         (var-set route-nonce (+ route-id u1))
@@ -144,28 +146,43 @@
         (let
             (
                 (updated-verified (+ (get verified-checkpoints route) u1))
+                (payment-info (unwrap! (map-get? route-payments route-id) err-not-found))
+                (partial-amount (/ (get payment-amount route) (get total-checkpoints route)))
             )
             (map-set routes route-id
                 (merge route {verified-checkpoints: updated-verified})
             )
+            (try! (as-contract (stx-transfer? partial-amount tx-sender (get transporter route))))
+            (map-set route-payments route-id
+                (merge payment-info {
+                    amount-released: (+ (get amount-released payment-info) partial-amount)
+                })
+            )
             (if (is-eq updated-verified (get total-checkpoints route))
-                (complete-route route-id)
+                (finalize-route route-id)
                 (ok true)
             )
         )
     )
 )
 
-(define-private (complete-route (route-id uint))
+(define-private (finalize-route (route-id uint))
     (let
         (
             (route (unwrap! (map-get? routes route-id) err-not-found))
             (payment (unwrap! (map-get? route-payments route-id) err-not-found))
             (current-height stacks-block-height)
             (transporter (get transporter route))
+            (remaining-amount (- (get amount payment) (get amount-released payment)))
         )
-        (asserts! (not (get released payment)) err-route-completed)
-        (try! (as-contract (stx-transfer? (get amount payment) tx-sender transporter)))
+        (asserts! (not (get fully-released payment)) err-route-completed)
+        (if (> remaining-amount u0)
+            (begin
+                (try! (as-contract (stx-transfer? remaining-amount tx-sender transporter)))
+                true
+            )
+            true
+        )
         (map-set routes route-id
             (merge route {
                 status: "completed",
@@ -174,7 +191,8 @@
         )
         (map-set route-payments route-id
             (merge payment {
-                released: true,
+                amount-released: (get amount payment),
+                fully-released: true,
                 released-at: (some current-height)
             })
         )
@@ -214,8 +232,13 @@
         (asserts! (is-eq tx-sender (get shipper route)) err-unauthorized)
         (asserts! (is-eq (get status route) "active") err-route-not-active)
         (asserts! (is-eq (get verified-checkpoints route) u0) err-route-completed)
-        (asserts! (not (get released payment)) err-route-completed)
-        (try! (as-contract (stx-transfer? (get amount payment) tx-sender (get shipper route))))
+        (asserts! (not (get fully-released payment)) err-route-completed)
+        (let
+            (
+                (refund-amount (- (get amount payment) (get amount-released payment)))
+            )
+            (try! (as-contract (stx-transfer? refund-amount tx-sender (get shipper route))))
+        )
         (map-set routes route-id
             (merge route {status: "cancelled"})
         )
@@ -248,6 +271,21 @@
             verified: (get verified-checkpoints route),
             total: (get total-checkpoints route),
             percentage: (/ (* (get verified-checkpoints route) u100) (get total-checkpoints route))
+        })
+    )
+)
+
+(define-read-only (get-payment-progress (route-id uint))
+    (let
+        (
+            (payment (unwrap! (map-get? route-payments route-id) err-not-found))
+        )
+        (ok {
+            total-amount: (get amount payment),
+            released-amount: (get amount-released payment),
+            remaining-amount: (- (get amount payment) (get amount-released payment)),
+            percentage-released: (/ (* (get amount-released payment) u100) (get amount payment)),
+            fully-released: (get fully-released payment)
         })
     )
 )
