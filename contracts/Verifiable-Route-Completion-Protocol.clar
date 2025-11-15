@@ -12,6 +12,9 @@
 (define-constant err-route-completed (err u108))
 (define-constant err-invalid-coordinates (err u109))
 (define-constant err-checkpoint-expired (err u110))
+(define-constant err-invalid-dispute (err u111))
+(define-constant err-dispute-exists (err u112))
+(define-constant err-no-expired-checkpoints (err u113))
 
 (define-data-var route-nonce uint u0)
 (define-data-var checkpoint-nonce uint u0)
@@ -59,6 +62,17 @@
         routes-completed: uint,
         total-earned: uint,
         success-rate: uint
+    }
+)
+
+(define-map route-disputes
+    uint
+    {
+        disputed-by: principal,
+        disputed-at: uint,
+        expired-checkpoints: uint,
+        refund-amount: uint,
+        processed: bool
     }
 )
 
@@ -306,4 +320,96 @@
             (<= (to-uint lon-diff) (get tolerance checkpoint))
         ))
     )
+)
+
+(define-public (dispute-route (route-id uint))
+    (let
+        (
+            (route (unwrap! (map-get? routes route-id) err-not-found))
+            (payment (unwrap! (map-get? route-payments route-id) err-not-found))
+            (current-height stacks-block-height)
+            (expired-count (count-expired-checkpoints route-id (get total-checkpoints route) current-height))
+        )
+        (asserts! (is-eq tx-sender (get shipper route)) err-unauthorized)
+        (asserts! (is-eq (get status route) "active") err-route-not-active)
+        (asserts! (is-none (map-get? route-disputes route-id)) err-dispute-exists)
+        (asserts! (> expired-count u0) err-no-expired-checkpoints)
+        (let
+            (
+                (refund-per-checkpoint (/ (get payment-amount route) (get total-checkpoints route)))
+                (total-refund (* refund-per-checkpoint expired-count))
+            )
+            (map-set route-disputes route-id {
+                disputed-by: tx-sender,
+                disputed-at: current-height,
+                expired-checkpoints: expired-count,
+                refund-amount: total-refund,
+                processed: false
+            })
+            (ok {expired-count: expired-count, refund-amount: total-refund})
+        )
+    )
+)
+
+(define-public (process-dispute (route-id uint))
+    (let
+        (
+            (route (unwrap! (map-get? routes route-id) err-not-found))
+            (dispute (unwrap! (map-get? route-disputes route-id) err-invalid-dispute))
+            (payment (unwrap! (map-get? route-payments route-id) err-not-found))
+        )
+        (asserts! (is-eq tx-sender (get shipper route)) err-unauthorized)
+        (asserts! (not (get processed dispute)) err-invalid-dispute)
+        (let
+            (
+                (available-refund (- (get amount payment) (get amount-released payment)))
+                (actual-refund (if (<= (get refund-amount dispute) available-refund)
+                                  (get refund-amount dispute)
+                                  available-refund))
+            )
+            (if (> actual-refund u0)
+                (try! (as-contract (stx-transfer? actual-refund tx-sender (get shipper route))))
+                true
+            )
+            (map-set route-disputes route-id
+                (merge dispute {processed: true})
+            )
+            (map-set routes route-id
+                (merge route {status: "disputed"})
+            )
+            (ok actual-refund)
+        )
+    )
+)
+
+(define-private (count-expired-checkpoints (route-id uint) (total uint) (current-height uint))
+    (let
+        (
+            (result (fold check-checkpoint-expired (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9) {count: u0, route-id: route-id, total: total, height: current-height}))
+        )
+        (get count result)
+    )
+)
+
+(define-private (check-checkpoint-expired (checkpoint-id uint) (acc {count: uint, route-id: uint, total: uint, height: uint}))
+    (if (< checkpoint-id (get total acc))
+        (let
+            (
+                (checkpoint-opt (map-get? checkpoints {route-id: (get route-id acc), checkpoint-id: checkpoint-id}))
+            )
+            (match checkpoint-opt
+                checkpoint
+                    (if (and (not (get verified checkpoint)) (> (get height acc) (get deadline checkpoint)))
+                        (merge acc {count: (+ (get count acc) u1)})
+                        acc
+                    )
+                acc
+            )
+        )
+        acc
+    )
+)
+
+(define-read-only (get-dispute-info (route-id uint))
+    (ok (map-get? route-disputes route-id))
 )
